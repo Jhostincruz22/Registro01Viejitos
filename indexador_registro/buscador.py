@@ -4,9 +4,23 @@ from difflib import SequenceMatcher
 
 import pandas as pd
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import messagebox, ttk, filedialog
 
 from .config import EXCEL_CENTRAL
+from . import utils
+
+# Carga opcional de librería fonética (jellyfish). Si no está instalada, el sistema sigue funcionando.
+try:
+    import jellyfish
+    HAS_JELLYFISH = True
+except Exception:
+    HAS_JELLYFISH = False
+
+try:
+    from reportlab.pdfgen import canvas as reportlab_canvas
+    HAS_REPORTLAB = True
+except Exception:
+    HAS_REPORTLAB = False
 
 
 def _normalizar_texto(valor):
@@ -111,6 +125,12 @@ class VentanaArbolAvanzado(tk.Toplevel):
         if pd.notna(fecha):
             return int(fecha.year)
 
+        # Intentar adquirir bloqueo para evitar escrituras concurrentes
+        bloqueo_ok = utils.adquirir_bloqueo(EXCEL_CENTRAL)
+        if not bloqueo_ok:
+            messagebox.showerror("Archivo en Uso", "El archivo maestro está siendo editado por otro usuario. Inténtelo más tarde.")
+            return
+
         try:
             return int(texto.split("/")[-1])
         except ValueError:
@@ -118,6 +138,44 @@ class VentanaArbolAvanzado(tk.Toplevel):
                 return int(texto)
             except ValueError:
                 return None
+  
+    def _generar_informe_pdf(self):
+        if not HAS_REPORTLAB:
+            messagebox.showerror("Error", "La librería 'reportlab' no está instalada.")
+            return
+
+        archivo_salida = filedialog.asksaveasfilename(
+            defaultextension=".pdf",
+            filetypes=[("Archivo PDF", "*.pdf")],
+            title="Guardar Informe Genealógico"
+        )
+        
+        if not archivo_salida:
+            return
+
+        c = reportlab_canvas.Canvas(archivo_salida)
+        c.setFont("Helvetica-Bold", 16)
+        c.drawString(50, 800, "Informe de Validación Genealógica - Registro Civil")
+        
+        c.setFont("Helvetica", 12)
+        c.drawString(50, 780, f"Sujeto Central: {self.sujeto['Nombre']}")
+        c.drawString(50, 765, f"Fecha de Consulta: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')}")
+        
+        c.line(50, 750, 550, 750)
+        
+        # Iterar sobre las relaciones validadas y confirmadas
+        y = 720
+        c.drawString(50, y, "Relaciones Confirmadas:")
+        y -= 20
+        
+        for item, datos in self.vinculos_a_guardar.items():
+            texto = f"- {datos['Pariente_Nombre']} ({datos['Parentesco']})"
+            c.drawString(70, y, texto)
+            y -= 15
+            
+        c.showPage()
+        c.save()
+        messagebox.showinfo("Éxito", "Informe PDF generado correctamente.")
 
     def _normalizar_fila(self, df):
         df = df.copy()
@@ -164,6 +222,16 @@ class VentanaArbolAvanzado(tk.Toplevel):
         df["madre_normalizada"] = df["madre_normalizada"].astype(str)
         df["padre_normalizado"] = df["padre_normalizado"].astype(str)
 
+        # Columnas fonéticas opcionales para búsqueda por sonido
+        if HAS_JELLYFISH:
+            df["nombre_phonetic"] = df["Nombre"].fillna("").map(lambda x: jellyfish.metaphone(str(x)))
+            df["madre_phonetic"] = df["Madre"].fillna("").map(lambda x: jellyfish.metaphone(str(x)))
+            df["padre_phonetic"] = df["Padre"].fillna("").map(lambda x: jellyfish.metaphone(str(x)))
+        else:
+            df["nombre_phonetic"] = ""
+            df["madre_phonetic"] = ""
+            df["padre_phonetic"] = ""
+
         return df
 
     def _construir_interfaz_arbol(self):
@@ -194,6 +262,9 @@ class VentanaArbolAvanzado(tk.Toplevel):
         btn_guardar = ttk.Button(top_panel, text="💾 Guardar Éxitos en Excel", command=self._guardar_vinculos_en_excel)
         btn_guardar.pack(side=tk.RIGHT, padx=10, pady=5)
 
+        btn_informe = ttk.Button(top_panel, text="📝 Generar Informe", command=self._generar_informe)
+        btn_informe.pack(side=tk.RIGHT, padx=6, pady=5)
+
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
 
@@ -205,6 +276,10 @@ class VentanaArbolAvanzado(tk.Toplevel):
 
         self.tabla_desc = self._crear_tabla_parentesco(self.tab_descendientes)
         self.tabla_colat = self._crear_tabla_parentesco(self.tab_colaterales)
+        # Pestaña de ascendencia (padres/abuelos)
+        self.tab_ascendentes = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab_ascendentes, text="Ascendencia (Padres, Abuelos)")
+        self.tabla_asc = self._crear_tabla_parentesco(self.tab_ascendentes)
 
     def _crear_tabla_parentesco(self, contenedor):
         frame = ttk.Frame(contenedor)
@@ -368,6 +443,11 @@ class VentanaArbolAvanzado(tk.Toplevel):
         tabla.item(item, values=valores, tags=("descartado",))
 
         self._actualizar_resumen()
+        # También analizar ascendencia para la pestaña correspondiente
+        try:
+            self._analizar_ascendencia()
+        except Exception:
+            pass
 
     def _analizar_red_completa(self):
         self.tabla_desc.delete(*self.tabla_desc.get_children())
@@ -388,6 +468,16 @@ class VentanaArbolAvanzado(tk.Toplevel):
         sujeto_nombre_norm = _normalizar_texto(self.sujeto.get("Nombre", ""))
         sujeto_madre_norm = _normalizar_texto(self.sujeto.get("Madre", ""))
         sujeto_padre_norm = _normalizar_texto(self.sujeto.get("Padre", ""))
+        sujeto_nombre_phon = None
+        sujeto_madre_phon = None
+        sujeto_padre_phon = None
+        if HAS_JELLYFISH:
+            try:
+                sujeto_nombre_phon = jellyfish.metaphone(self.sujeto.get("Nombre", "") or "")
+                sujeto_madre_phon = jellyfish.metaphone(self.sujeto.get("Madre", "") or "")
+                sujeto_padre_phon = jellyfish.metaphone(self.sujeto.get("Padre", "") or "")
+            except Exception:
+                sujeto_nombre_phon = sujeto_madre_phon = sujeto_padre_phon = None
 
         hijos_detectados = []
         nietos_detectados = []
@@ -407,6 +497,17 @@ class VentanaArbolAvanzado(tk.Toplevel):
                 _calcular_similitud(fila["padre_normalizado"], sujeto_nombre_norm),
             ) * 100
             score_hijo = self._ajustar_puntaje_por_homonimos(fila, score_hijo)
+            # impulso fonético si hay coincidencia de metaphone
+            try:
+                if HAS_JELLYFISH and sujeto_nombre_phon:
+                    madre_ph = str(fila.get("madre_phonetic", ""))
+                    padre_ph = str(fila.get("padre_phonetic", ""))
+                    if madre_ph and madre_ph == sujeto_nombre_phon:
+                        score_hijo += 10
+                    if padre_ph and padre_ph == sujeto_nombre_phon:
+                        score_hijo += 10
+            except Exception:
+                pass
 
             if score_hijo >= 78:
                 fila_dict = fila.to_dict()
@@ -429,6 +530,16 @@ class VentanaArbolAvanzado(tk.Toplevel):
                 _calcular_similitud(fila["padre_normalizado"], sujeto_padre_norm),
             ) * 100
             score_hermano = self._ajustar_puntaje_por_homonimos(fila, score_hermano)
+            try:
+                if HAS_JELLYFISH:
+                    madre_ph = str(fila.get("madre_phonetic", ""))
+                    padre_ph = str(fila.get("padre_phonetic", ""))
+                    if madre_ph and sujeto_madre_phon and madre_ph == sujeto_madre_phon:
+                        score_hermano += 8
+                    if padre_ph and sujeto_padre_phon and padre_ph == sujeto_padre_phon:
+                        score_hermano += 8
+            except Exception:
+                pass
 
             if score_hermano >= 82:
                 fila_dict = fila.to_dict()
@@ -739,9 +850,109 @@ class VentanaArbolAvanzado(tk.Toplevel):
             if self.callback_recargar:
                 self.callback_recargar()
             self.destroy()
-
         except Exception as error:
             messagebox.showerror("Error Crítico", f"No se pudo escribir en el Excel central. Verifica que no esté abierto por otra persona.\nDetalle: {error}")
+        finally:
+            try:
+                utils.liberar_bloqueo(EXCEL_CENTRAL)
+            except Exception:
+                pass
+
+    def _generar_informe(self):
+        """Genera un informe textual simple de la familia detectada y confirmada."""
+        try:
+            lines = []
+            sujeto = self.sujeto.get("Nombre", "Sujeto")
+            lines.append(f"Informe Genealógico - Sujeto: {sujeto}")
+            lines.append(f"Clave: {self.sujeto.get('clave_registro')}")
+            lines.append("")
+
+            lines.append("Confirmados:")
+            for v in self.vinculos_a_guardar.values():
+                lines.append(f"- {v.get('Parentesco')}: {v.get('Nombre')} (Clave: {v.get('clave_registro')})")
+
+            lines.append("")
+            lines.append("Rechazados:")
+            for v in self.rechazados.values():
+                lines.append(f"- {v.get('Parentesco')}: {v.get('Nombre')} (Clave: {v.get('clave_registro')})")
+
+            lines.append("")
+            lines.append("Descartados:")
+            for v in self.descartados.values():
+                lines.append(f"- {v.get('Parentesco')}: {v.get('Nombre')} (Clave: {v.get('clave_registro')})")
+
+            # Guardar en archivo
+            carpeta = os.path.dirname(EXCEL_CENTRAL) or "."
+            nombre = f"informe_genealogico_{self.sujeto.get('clave_registro').replace('|','_')}_{int(pd.Timestamp.now().timestamp())}.txt"
+            ruta = os.path.join(carpeta, nombre)
+            with open(ruta, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines))
+
+            # Si reportlab está disponible, generar también PDF
+            if HAS_REPORTLAB:
+                try:
+                    ruta_pdf = os.path.splitext(ruta)[0] + ".pdf"
+                    c = reportlab_canvas.Canvas(ruta_pdf)
+                    ancho, alto = 595, 842
+                    y = alto - 40
+                    c.setFont("Helvetica", 10)
+                    for linea in lines:
+                        c.drawString(40, y, linea)
+                        y -= 14
+                        if y < 40:
+                            c.showPage()
+                            c.setFont("Helvetica", 10)
+                            y = alto - 40
+                    c.save()
+                    messagebox.showinfo("Informe generado", f"Informe guardado en:\n{ruta}\n{ruta_pdf}")
+                    return
+                except Exception:
+                    # si falla PDF, caer al TXT
+                    pass
+
+            messagebox.showinfo("Informe generado", f"Informe guardado en:\n{ruta}")
+        except Exception as error:
+            messagebox.showerror("Error", f"No se pudo generar el informe:\n{error}")
+
+    def _analizar_ascendencia(self):
+        """Llena la tabla de ascendencia buscando padres y abuelos del sujeto."""
+        try:
+            self.tabla_asc.delete(*self.tabla_asc.get_children())
+            if getattr(self, 'registros_df', None) is None or self.registros_df.empty:
+                return
+
+            sujeto = self.sujeto
+            madre = sujeto.get("Madre", "")
+            padre = sujeto.get("Padre", "")
+
+            encontrados = []
+            # Buscar padre/madre directos
+            for _, fila in self.registros_df.iterrows():
+                if fila.get("Nombre", "") == madre and madre:
+                    encontrados.append((fila, "Madre"))
+                if fila.get("Nombre", "") == padre and padre:
+                    encontrados.append((fila, "Padre"))
+
+            # Buscar padres de padres (abuelos)
+            abuelos = []
+            for fila, rol in encontrados:
+                madre_ab = fila.get("Madre", "")
+                padre_ab = fila.get("Padre", "")
+                for _, f2 in self.registros_df.iterrows():
+                    if f2.get("Nombre", "") == madre_ab and madre_ab:
+                        abuelos.append((f2, f"Abuelo/a ({rol})"))
+                    if f2.get("Nombre", "") == padre_ab and padre_ab:
+                        abuelos.append((f2, f"Abuelo/a ({rol})"))
+
+            # Agregar filas
+            for fila, etiqueta in encontrados:
+                obs = self._calcular_observacion(fila.to_dict(), etiqueta)
+                self._agregar_fila(self.tabla_asc, fila, etiqueta, "-", 0.0, obs)
+            for fila, etiqueta in abuelos:
+                obs = self._calcular_observacion(fila.to_dict(), etiqueta)
+                self._agregar_fila(self.tabla_asc, fila, etiqueta, "-", 0.0, obs)
+        except Exception:
+            return
 
 
 class VentanaBuscador(tk.Toplevel):
@@ -782,6 +993,10 @@ class VentanaBuscador(tk.Toplevel):
 
         self.lbl_estado = ttk.Label(self.left_frame, text="Esperando búsqueda...", foreground="#2c3e50")
         self.lbl_estado.pack(anchor=tk.W, padx=10, pady=(0, 5))
+
+        # Barra de salud del registro (resumen rápido de datos faltantes / sospechosos)
+        self.lbl_salud = ttk.Label(self.left_frame, text="Salud del registro: --", foreground="#6b7280")
+        self.lbl_salud.pack(anchor=tk.W, padx=10, pady=(0, 8))
 
         frame_tabla = ttk.Frame(self.left_frame)
         frame_tabla.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
@@ -898,6 +1113,15 @@ class VentanaBuscador(tk.Toplevel):
                     df["nombre_normalizado"] = df["nombre_normalizado"].replace("", pd.NA).fillna(df["Nombre"].map(_normalizar_texto))
                     df["madre_normalizada"] = df["madre_normalizada"].replace("", pd.NA).fillna(df["Madre"].map(_normalizar_texto))
                     df["padre_normalizado"] = df["padre_normalizado"].replace("", pd.NA).fillna(df["Padre"].map(_normalizar_texto))
+                    # fonética por hoja
+                    if HAS_JELLYFISH:
+                        df["nombre_phonetic"] = df["Nombre"].fillna("").map(lambda x: jellyfish.metaphone(str(x)))
+                        df["madre_phonetic"] = df["Madre"].fillna("").map(lambda x: jellyfish.metaphone(str(x)))
+                        df["padre_phonetic"] = df["Padre"].fillna("").map(lambda x: jellyfish.metaphone(str(x)))
+                    else:
+                        df["nombre_phonetic"] = ""
+                        df["madre_phonetic"] = ""
+                        df["padre_phonetic"] = ""
                     df["identificador_registro"] = (
                         df["Pestaña"].astype(str)
                         + "|"
@@ -926,6 +1150,23 @@ class VentanaBuscador(tk.Toplevel):
                     self.registros_df["padre_normalizado"] = self.registros_df["Padre"].map(_normalizar_texto)
                     self.registros_df["nombre_normalizado"] = self.registros_df["Nombre"].map(_normalizar_texto)
                     self.registros_df["comunidad_normalizada"] = self.registros_df["Comunidad"].map(_normalizar_texto)
+                    if HAS_JELLYFISH:
+                        self.registros_df["nombre_phonetic"] = self.registros_df["Nombre"].fillna("").map(lambda x: jellyfish.metaphone(str(x)))
+                        self.registros_df["madre_phonetic"] = self.registros_df["Madre"].fillna("").map(lambda x: jellyfish.metaphone(str(x)))
+                        self.registros_df["padre_phonetic"] = self.registros_df["Padre"].fillna("").map(lambda x: jellyfish.metaphone(str(x)))
+                    else:
+                        self.registros_df["nombre_phonetic"] = ""
+                        self.registros_df["madre_phonetic"] = ""
+                        self.registros_df["padre_phonetic"] = ""
+
+                    # actualizar barra de salud
+                    total = len(self.registros_df)
+                    invalid_nombre = self.registros_df["Nombre"].astype(str).str.match(r"^\d+$").sum()
+                    missing_parent = self.registros_df["Madre"].astype(str).str.strip().replace("", "no registrado").str.lower().isin(["no registrado", "noregistrado"]).sum()
+                    try:
+                        self.lbl_salud.config(text=f"Registros: {total} | Nombres numéricos: {invalid_nombre} | Madres no registradas: {missing_parent}")
+                    except Exception:
+                        pass
 
                     self.lbl_estado.config(text=f"Registros cargados: {len(self.registros_df)}")
                     self.ejecutar_busqueda()
@@ -956,8 +1197,17 @@ class VentanaBuscador(tk.Toplevel):
                 "comunidad_normalizada",
             ]
             mascara = pd.Series(False, index=base.index)
+            term_phon = None
+            if HAS_JELLYFISH:
+                try:
+                    term_phon = jellyfish.metaphone(termino)
+                except Exception:
+                    term_phon = None
             for columna in columnas_busqueda:
                 mascara = mascara | base[columna].fillna("").astype(str).str.contains(termino, regex=False, na=False)
+            # búsqueda fonética adicional
+            if HAS_JELLYFISH and term_phon:
+                mascara = mascara | base["nombre_phonetic"].fillna("").astype(str).str.contains(term_phon, na=False)
             base = base[mascara].copy()
 
         if base.empty:
@@ -1078,13 +1328,23 @@ class VentanaBuscador(tk.Toplevel):
             x = 70 + columna * paso_x if columna == 0 else 290
             y = 150 + fila_idx * paso_y
 
+            # Pintar nodos gris si la madre no está registrada o si el nombre es claramente inválido
+            nombre_raw = str(fila.get('Nombre', '')).strip()
+            madre_raw = str(fila.get('Madre', '')).strip().lower()
+            if madre_raw in ["no registrado", "noregistrado", ""] or nombre_raw.isdigit():
+                fill = "#9ca3af"  # gris
+                outline = "#6b7280"
+            else:
+                fill = "#3498db"
+                outline = "#21618c"
+
             node_id = self.canvas.create_oval(
                 x - 26,
                 y - 18,
                 x + 26,
                 y + 18,
-                fill="#3498db",
-                outline="#21618c",
+                fill=fill,
+                outline=outline,
                 width=2,
                 tags=(f"nodo_{fila['clave_registro']}", "nodo", "hijo"),
             )

@@ -82,3 +82,34 @@ def guardar_archivo_central(diccionario_hojas, ruta_archivo=EXCEL_CENTRAL):
     with pd.ExcelWriter(ruta_archivo, engine="openpyxl") as writer:
         for nombre_hoja, df in diccionario_hojas.items():
             df.to_excel(writer, sheet_name=nombre_hoja, index=False)
+
+
+def adquirir_bloqueo(ruta_archivo=EXCEL_CENTRAL):
+    """Intenta crear un archivo .lock junto al archivo maestro.
+    Retorna True si el bloqueo fue exitoso, False si ya existe otro bloqueo.
+    """
+    lock_path = f"{ruta_archivo}.lock"
+    try:
+        # Crear el archivo de bloqueo de forma atómica
+        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        try:
+            os.write(fd, f"pid:{os.getpid()}\n".encode("utf-8"))
+        finally:
+            os.close(fd)
+        return True
+    except FileExistsError:
+        return False
+    except Exception:
+        return False
+
+
+def liberar_bloqueo(ruta_archivo=EXCEL_CENTRAL):
+    """Elimina el archivo .lock si existe."""
+    lock_path = f"{ruta_archivo}.lock"
+    try:
+        if os.path.exists(lock_path):
+            os.remove(lock_path)
+            return True
+    except Exception:
+        return False
+    return False
